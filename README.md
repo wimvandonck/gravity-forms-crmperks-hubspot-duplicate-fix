@@ -2,7 +2,7 @@
 
 When an admin duplicates a Gravity Form in WordPress, the CRM Perks HubSpot integration settings are **not** copied over to the new form by default. This forces admins to manually rebuild the entire HubSpot mapping from scratch for every cloned form.
 
-This PHP snippet fixes that by hooking into Gravity Forms' duplication process and automatically copying the CRM Perks HubSpot feed configuration to the newly cloned form.
+This PHP snippet fixes that by hooking into Gravity Forms' duplication process and automatically copying the CRM Perks HubSpot feed configuration to the newly cloned form. Links between feeds (for example deal → contact → company) are re-linked to the cloned feeds, so the copy works straight away.
 
 ## Background
 
@@ -30,18 +30,18 @@ Upload the entire `duplicate-feed-fix.php` file to your `/wp-content/mu-plugins/
 ## How It Works
 
 1. Listens for the `gform_post_form_duplicated` action hook fired by Gravity Forms after a form is cloned.
-2. Queries the `wp_vxg_hubspot` table for any feeds linked to the original form.
-3. Strips the original primary key (`id`) so the database generates a fresh one.
-4. Updates the `form_id` to point to the newly cloned form.
-5. Appends `(Cloned)` to the feed name to keep things unique.
-6. Scans inside any JSON configuration columns for internal `form_id` references and updates those too.
-7. Inserts the updated feed row into the table and flushes the Gravity Forms cache so the new feed appears immediately in the admin UI.
+2. Queries the `wp_vxg_hubspot` table for all feeds linked to the original form.
+3. Copies every feed: the primary key (`id`) is dropped so the database generates a new one, `form_id` points to the new form and `(Cloned)` is appended to the feed name.
+4. Keeps an old feed ID → new feed ID map while copying.
+5. In the cloned feeds, rewrites every `object_*` value (for example `object_contact`, `object_company`) that matches an old feed ID to the new ID, and updates internal `form_id` references. Only exact ID matches are changed.
+6. Flushes the Gravity Forms cache so the new feeds appear immediately in the admin UI.
 
 ## Notes
 
 - **Database prefix:** The snippet uses `$wpdb->prefix` dynamically, so it works regardless of your custom database table prefix (e.g. `zqab_`, `wp_`, etc.).
 - **Read safety:** The diagnostic tool used to discover the table location was fully read-only and did not modify any data.
 - **Multiple feeds:** If a form has more than one HubSpot feed configured, all of them will be duplicated.
+- **Linked feeds:** Works for any form and any combination of feeds, because the remapping is driven by the feed IDs found in the data. Forms that were cloned with version 1.0.0 are not repaired; delete the clone and duplicate the form again.
 
 ## Diagnostic Tool
 
