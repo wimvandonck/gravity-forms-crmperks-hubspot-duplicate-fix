@@ -1,14 +1,14 @@
 <?php
 /**
  * Plugin Name: Gravity Forms – CRM Perks HubSpot Duplicate Feed Fix
- * Description: Automatically copies CRM Perks HubSpot feed settings when a Gravity Form is duplicated.
- * Version: 1.0.0
+ * Description: Copies CRM Perks HubSpot feeds when a Gravity Form is duplicated, including the links between feeds (deal → contact → company).
+ * Version: 1.1.0
  * Author: Wim Vandonck
  *
  * How to use:
- * Option A) Paste the code below (excluding the plugin header) into your child theme's functions.php.
- * Option B) Add this entire file as a Must-Use (mu-plugins) plugin.
- * Option C) Use a code snippet plugin like WPCode and paste the add_action block below.
+ * A) Paste everything below this header into your child theme's functions.php.
+ * B) Paste it into a code snippet plugin (WPCode, Code Snippets) as a PHP snippet.
+ * C) Upload this whole file to /wp-content/mu-plugins/.
  */
 
 add_action( 'gform_post_form_duplicated', 'copy_custom_crmperks_hubspot_feed', 10, 2 );
@@ -16,55 +16,106 @@ add_action( 'gform_post_form_duplicated', 'copy_custom_crmperks_hubspot_feed', 1
 function copy_custom_crmperks_hubspot_feed( $original_form_id, $new_form_id ) {
     global $wpdb;
 
-    // Target the exact custom table used by CRM Perks HubSpot.
-    // The prefix (e.g. 'zqab_') is handled automatically by $wpdb->prefix.
     $table_name = $wpdb->prefix . 'vxg_hubspot';
 
-    // 1. Get all CRM Perks mappings for the original form
     $original_feeds = $wpdb->get_results(
-        $wpdb->prepare( "SELECT * FROM {$table_name} WHERE form_id = %d", $original_form_id ),
+        $wpdb->prepare( "SELECT * FROM {$table_name} WHERE form_id = %d ORDER BY id ASC", $original_form_id ),
         ARRAY_A
     );
 
-    if ( ! empty( $original_feeds ) ) {
-        foreach ( $original_feeds as $feed ) {
+    if ( empty( $original_feeds ) ) {
+        return;
+    }
 
-            // 2. Remove the unique primary key so the database auto-generates a new one
-            if ( isset( $feed['id'] ) ) {
-                unset( $feed['id'] );
-            }
+    $id_map = array(); // old feed ID => new feed ID
 
-            // 3. Update the form_id to point to the newly cloned form
-            $feed['form_id'] = $new_form_id;
+    // Step 1: copy all feeds and keep track of the old => new ID mapping
+    foreach ( $original_feeds as $feed ) {
+        $old_id = (string) $feed['id'];
+        unset( $feed['id'] );
 
-            // 4. Make the feed name unique to avoid conflicts
-            if ( isset( $feed['name'] ) ) {
-                $feed['name'] = $feed['name'] . ' (Cloned)';
-            }
-            if ( isset( $feed['feed_name'] ) ) {
-                $feed['feed_name'] = $feed['feed_name'] . ' (Cloned)';
-            }
+        $feed['form_id'] = $new_form_id;
 
-            // 5. Scan JSON columns for hidden internal form_id references and update them
-            foreach ( $feed as $key => $value ) {
-                if ( is_string( $value ) && ( strpos( $value, '{' ) === 0 || strpos( $value, '[' ) === 0 ) ) {
-                    $decoded = json_decode( $value, true );
-                    if ( is_array( $decoded ) && isset( $decoded['form_id'] ) ) {
-                        $decoded['form_id'] = $new_form_id;
-                        $feed[ $key ] = wp_json_encode( $decoded );
-                    }
-                }
-            }
-
-            // 6. Insert the cloned row into the CRM Perks custom table
-            $wpdb->insert( $table_name, $feed );
+        if ( isset( $feed['name'] ) ) {
+            $feed['name'] .= ' (Cloned)';
+        }
+        if ( isset( $feed['feed_name'] ) ) {
+            $feed['feed_name'] .= ' (Cloned)';
         }
 
-        // 7. Clear Gravity Forms cache so the UI reflects the new feeds immediately
-        if ( class_exists( 'GFCache' ) ) {
-            GFCache::flush();
-        } else {
-            wp_cache_flush();
+        if ( $wpdb->insert( $table_name, $feed ) ) {
+            $id_map[ $old_id ] = (string) $wpdb->insert_id;
         }
+    }
+
+    // Step 2: in the cloned feeds, remap all object_* references and form_ids
+    foreach ( $id_map as $new_id ) {
+        $row = $wpdb->get_row(
+            $wpdb->prepare( "SELECT * FROM {$table_name} WHERE id = %d", $new_id ),
+            ARRAY_A
+        );
+        if ( ! $row ) {
+            continue;
+        }
+
+        $updates = array();
+
+        foreach ( $row as $column => $value ) {
+            if ( in_array( $column, array( 'id', 'form_id' ), true ) || ! is_string( $value ) || $value === '' ) {
+                continue;
+            }
+
+            $is_serialized = is_serialized( $value );
+            $data = $is_serialized ? maybe_unserialize( $value ) : json_decode( $value, true );
+
+            if ( ! is_array( $data ) ) {
+                continue;
+            }
+
+            $changed = false;
+            $data = vx_remap_feed_refs( $data, $id_map, $original_form_id, $new_form_id, $changed );
+
+            if ( $changed ) {
+                $updates[ $column ] = $is_serialized ? maybe_serialize( $data ) : wp_json_encode( $data );
+            }
+        }
+
+        if ( ! empty( $updates ) ) {
+            $wpdb->update( $table_name, $updates, array( 'id' => $new_id ) );
+        }
+    }
+
+    if ( class_exists( 'GFCache' ) ) {
+        GFCache::flush();
+    } else {
+        wp_cache_flush();
+    }
+}
+
+if ( ! function_exists( 'vx_remap_feed_refs' ) ) {
+    function vx_remap_feed_refs( $data, $id_map, $old_form_id, $new_form_id, &$changed ) {
+        foreach ( $data as $key => $value ) {
+            if ( is_array( $value ) ) {
+                $data[ $key ] = vx_remap_feed_refs( $value, $id_map, $old_form_id, $new_form_id, $changed );
+                continue;
+            }
+
+            if ( ! is_scalar( $value ) || ! is_string( $key ) ) {
+                continue;
+            }
+
+            // Reference to another feed, e.g. object_contact or object_company
+            if ( strpos( $key, 'object_' ) === 0 && isset( $id_map[ (string) $value ] ) ) {
+                $data[ $key ] = $id_map[ (string) $value ];
+                $changed = true;
+            }
+
+            // Hidden form_id reference
+            if ( $key === 'form_id' && (string) $value === (string) $old_form_id ) {
+                $data[ $key ] = $new_form_id;
+                $changed = true;
+            }
+        }
+        return $data;
     }
 }
